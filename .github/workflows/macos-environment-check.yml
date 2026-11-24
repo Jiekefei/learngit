@@ -1,0 +1,63 @@
+name: macOS native environment check
+on:
+  push:
+    branches: [codex/macos-environment-check-20261124]
+    paths: [.github/workflows/macos-environment-check.yml]
+  workflow_dispatch:
+permissions: {}
+jobs:
+  native-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Check native tools and architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -m
+          sw_vers -productVersion
+          xcrun --find swift
+          test -x /usr/bin/hdiutil
+          test -x /usr/bin/codesign
+      - name: Test native directory events
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          cat > events.swift <<'SWIFT'
+          import Foundation
+          import CoreServices
+          final class Signal { var seen = false }
+          let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+          try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+          defer { try? FileManager.default.removeItem(at: directory) }
+          let signal = Signal()
+          var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(signal).toOpaque(), retain: nil, release: nil, copyDescription: nil)
+          let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+              guard let info = info else { return }
+              Unmanaged<Signal>.fromOpaque(info).takeUnretainedValue().seen = true
+          }
+          guard let stream = FSEventStreamCreate(nil, callback, &context, [directory.path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.1, FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)) else { fatalError("cannot create event stream") }
+          FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+          guard FSEventStreamStart(stream) else { fatalError("cannot start event stream") }
+          defer { FSEventStreamStop(stream); FSEventStreamInvalidate(stream); FSEventStreamRelease(stream) }
+          try Data("synthetic event fixture".utf8).write(to: directory.appendingPathComponent("fixture.txt"))
+          let deadline = Date().addingTimeInterval(10)
+          while !signal.seen && Date() < deadline { CFRunLoopRunInMode(CFRunLoopMode.defaultMode, 0.2, false) }
+          guard signal.seen else { fatalError("no native filesystem callback received") }
+          print("NATIVE_FSEVENTS_PASS")
+          SWIFT
+          xcrun swift events.swift
+      - name: Create and verify a synthetic disk image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/image-fixture"
+          printf '%s\n' 'Synthetic packaging test. Not an application or release.' > "$RUNNER_TEMP/image-fixture/TEST.txt"
+          hdiutil create -volname BuildProbe -srcfolder "$RUNNER_TEMP/image-fixture" -fs HFS+ -format UDZO -o "$RUNNER_TEMP/build-probe.dmg"
+          hdiutil verify "$RUNNER_TEMP/build-probe.dmg"
+          echo SYNTHETIC_DMG_CHECK_PASS
